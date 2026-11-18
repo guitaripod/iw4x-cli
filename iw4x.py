@@ -3,7 +3,8 @@
 
 The connect is handed to an already-running game over IW4x's own IPC pipe
 (``iw4x://host:port`` parsed by iw4x.dll), so it never needs the in-game
-server browser.
+server browser. Both the shortcut to launch and the Proton prefix to talk to
+are read from the Steam non-Steam shortcut that runs iw4x.exe.
 """
 
 from __future__ import annotations
@@ -12,15 +13,15 @@ import argparse
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
-STEAM_APPID = "10190"
-GAME_FOLDER = "Call of Duty Modern Warfare 2"
 MASTER_URL = "https://master.iw4x.io/v1/servers/iw4x?protocol=153"
 DEFAULT_PORT = 28960
+SHORTCUT_EXE = "iw4x.exe"
 
 COLOR_CODES = re.compile(r"\^[0-9:;]")
 NON_PRINTABLE = re.compile(r"[^\x20-\x7e]")
@@ -49,29 +50,92 @@ def library_roots() -> list[Path]:
     return [path for path in roots if path.is_dir()]
 
 
+def read_binary_vdf(data: bytes, offset: int = 0) -> tuple[dict, int]:
+    fields: dict = {}
+    while offset < len(data):
+        kind = data[offset]
+        if kind == 0x08:
+            return fields, offset + 1
+        if kind not in (0x00, 0x01, 0x02, 0x07):
+            raise CliError(f"unexpected shortcuts.vdf byte 0x{kind:02x} at {offset}")
+        end = data.index(b"\x00", offset + 1)
+        key = data[offset + 1 : end].decode("utf-8", "replace")
+        offset = end + 1
+        if kind == 0x00:
+            fields[key], offset = read_binary_vdf(data, offset)
+        elif kind == 0x01:
+            end = data.index(b"\x00", offset)
+            fields[key] = data[offset:end].decode("utf-8", "replace")
+            offset = end + 1
+        elif kind == 0x02:
+            fields[key] = struct.unpack("<I", data[offset : offset + 4])[0]
+            offset += 4
+        else:
+            fields[key] = struct.unpack("<Q", data[offset : offset + 8])[0]
+            offset += 8
+    return fields, offset
+
+
+def shortcut_entries(node: dict) -> list[dict]:
+    found = []
+    for value in node.values():
+        if isinstance(value, dict):
+            if value.get("appid") and value.get("Exe"):
+                found.append(value)
+            found.extend(shortcut_entries(value))
+    return found
+
+
+def shortcuts() -> list[dict]:
+    entries = []
+    for userdata in sorted(steam_root().glob("userdata/*/config/shortcuts.vdf")):
+        try:
+            parsed, _ = read_binary_vdf(userdata.read_bytes())
+        except (CliError, ValueError, IndexError):
+            continue
+        entries.extend(shortcut_entries(parsed))
+    return entries
+
+
+def clean_path(value: str) -> Path:
+    return Path(value.strip().strip('"').strip())
+
+
+def iw4x_shortcut() -> dict:
+    candidates = [
+        entry
+        for entry in shortcuts()
+        if clean_path(entry.get("Exe", "")).name.lower() == SHORTCUT_EXE
+    ]
+    preferred = [entry for entry in candidates if "iw4x" in entry.get("AppName", "").lower()]
+    chosen = (preferred or candidates)[:1]
+    if not chosen:
+        raise CliError(f"no Steam shortcut runs {SHORTCUT_EXE}; add one in Steam first")
+    return chosen[0]
+
+
 def game_dir() -> Path:
-    for root in library_roots():
-        candidate = root / "steamapps" / "common" / GAME_FOLDER
-        if (candidate / "iw4x.exe").is_file():
-            return candidate
-    raise CliError(f"{GAME_FOLDER} with iw4x.exe not found in any Steam library")
+    directory = clean_path(iw4x_shortcut()["Exe"]).parent
+    if not (directory / SHORTCUT_EXE).is_file():
+        raise CliError(f"{directory} has no {SHORTCUT_EXE}")
+    return directory
 
 
-def compat_data() -> Path:
+def compat_data(appid: int) -> Path:
     for root in library_roots():
-        candidate = root / "steamapps" / "compatdata" / STEAM_APPID
+        candidate = root / "steamapps" / "compatdata" / str(appid)
         if (candidate / "pfx").is_dir():
             return candidate
-    raise CliError(f"Proton prefix for app {STEAM_APPID} not found")
+    raise CliError(f"no Proton prefix for app {appid}; launch the IW4x shortcut once")
 
 
-def proton_binary() -> Path:
+def proton_binary(appid: int) -> Path:
     override = os.environ.get("IW4X_PROTON")
     if override:
         return Path(override)
-    info = compat_data() / "config_info"
+    info = compat_data(appid) / "config_info"
     if not info.is_file():
-        raise CliError(f"{info} missing, cannot tell which Proton the game runs under")
+        raise CliError(f"{info} missing, cannot tell which Proton the shortcut uses")
     for line in info.read_text().splitlines():
         if "/files/" in line:
             files = Path(line.rstrip("/"))
@@ -133,9 +197,7 @@ def table(servers: list[dict]) -> str:
 
 
 def is_address(query: str) -> bool:
-    if ADDRESS.match(query):
-        return True
-    return bool(BARE_IPV4.match(query))
+    return bool(ADDRESS.match(query) or BARE_IPV4.match(query))
 
 
 def as_address(query: str) -> str:
@@ -143,25 +205,27 @@ def as_address(query: str) -> str:
 
 
 def game_running() -> bool:
-    probe = subprocess.run(["pgrep", "-af", r"iw4mp\.exe|iw4x\.exe"], capture_output=True, text=True)
+    probe = subprocess.run(["pgrep", "-af", r"iw4x\.exe|iw4mp\.exe"], capture_output=True, text=True)
     own = str(os.getpid())
     return any(own not in line for line in probe.stdout.splitlines())
 
 
 def wine_handoff(connect_url: str) -> None:
+    shortcut = iw4x_shortcut()
+    appid = shortcut["appid"]
     directory = game_dir()
     environment = dict(os.environ)
     environment.update(
         {
             "WINEDEBUG": "-all",
             "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(steam_root()),
-            "STEAM_COMPAT_DATA_PATH": str(compat_data()),
-            "STEAM_COMPAT_MOUNTS": str(directory.parent.parent),
+            "STEAM_COMPAT_DATA_PATH": str(compat_data(appid)),
+            "STEAM_COMPAT_MOUNTS": str(directory),
         }
     )
     print(f"handing {connect_url} to the running game…", flush=True)
     result = subprocess.run(
-        [str(proton_binary()), "run", "iw4x.exe", connect_url],
+        [str(proton_binary(appid)), "run", SHORTCUT_EXE, connect_url],
         cwd=directory,
         env=environment,
         capture_output=True,
@@ -175,19 +239,30 @@ def wine_handoff(connect_url: str) -> None:
 
 
 def steam_launch(connect_url: str) -> None:
+    appid = iw4x_shortcut()["appid"]
     subprocess.Popen(
-        ["steam", "-applaunch", STEAM_APPID, connect_url],
+        ["steam", "-applaunch", str(appid), connect_url],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    print(f"launching the game with {connect_url}.")
-    print("if it opens at the main menu instead, run the same command again.")
+    print(f"launching the IW4x shortcut with {connect_url}.")
+    print("if it opens at the main menu instead, run the same command again once the game is up.")
+
+
+def connect(address: str, dry_run: bool) -> None:
+    print(f"{address}  iw4x://{address}")
+    if dry_run:
+        return
+    connect_url = f"iw4x://{address}"
+    if game_running():
+        wine_handoff(connect_url)
+    else:
+        steam_launch(connect_url)
 
 
 def command_list(arguments: argparse.Namespace) -> None:
-    servers = fetch_servers()
-    visible = ranked(servers, arguments.all, arguments.min_players)
+    visible = ranked(fetch_servers(), arguments.all, arguments.min_players)
     if arguments.target:
         visible = [server for server in visible if matches(server, arguments.target)]
     if arguments.json:
@@ -198,38 +273,29 @@ def command_list(arguments: argparse.Namespace) -> None:
     print(table(visible))
 
 
-def command_join(arguments: argparse.Namespace) -> None:
-    target = arguments.target.removeprefix("iw4x://").strip() if arguments.target else ""
-    if not target:
-        raise CliError("give a server name, an ip:port, or use the picker (no argument)")
-
-    address = None
+def resolve(target: str) -> str:
     if is_address(target):
-        address = as_address(target)
-    elif target.isdigit():
+        return as_address(target)
+    if target.isdigit():
         populated = ranked(fetch_servers(), False, 1)
         index = int(target)
         if not 1 <= index <= len(populated):
             raise CliError(f"index {index} is out of range for the {len(populated)} populated servers")
-        address = address_of(populated[index - 1])
-    else:
-        visible = [server for server in ranked(fetch_servers(), False, 1) if matches(server, target)]
-        if len(visible) == 1:
-            address = address_of(visible[0])
-        elif not visible:
-            raise CliError(f"nothing matched {target!r}")
-        else:
-            print(table(visible))
-            raise CliError(f"{len(visible)} servers matched {target!r}, narrow it down or pass an ip:port")
+        return address_of(populated[index - 1])
+    visible = [server for server in ranked(fetch_servers(), False, 1) if matches(server, target)]
+    if len(visible) == 1:
+        return address_of(visible[0])
+    if not visible:
+        raise CliError(f"nothing matched {target!r}")
+    print(table(visible))
+    raise CliError(f"{len(visible)} servers matched {target!r}, narrow it down or pass an ip:port")
 
-    print(f"{address}  iw4x://{address}")
-    if arguments.dry_run:
-        return
-    connect_url = f"iw4x://{address}"
-    if game_running():
-        wine_handoff(connect_url)
-    else:
-        steam_launch(connect_url)
+
+def command_join(arguments: argparse.Namespace) -> None:
+    target = arguments.target.removeprefix("iw4x://").strip() if arguments.target else ""
+    if not target:
+        raise CliError("give a server name, an ip:port, or omit the argument for the picker")
+    connect(resolve(target), arguments.dry_run)
 
 
 def command_pick(arguments: argparse.Namespace) -> int:
@@ -242,23 +308,14 @@ def command_pick(arguments: argparse.Namespace) -> int:
     choice = input("\njoin #> ").strip()
     if not choice:
         return 0
-    if choice.isdigit() and 1 <= int(choice) <= len(visible):
-        address = address_of(visible[int(choice) - 1])
-        print(f"{address}  iw4x://{address}")
-        connect_url = f"iw4x://{address}"
-        if game_running():
-            wine_handoff(connect_url)
-        else:
-            steam_launch(connect_url)
-        return 0
-    arguments.target = choice
-    command_join(arguments)
+    address = address_of(visible[int(choice) - 1]) if choice.isdigit() and 1 <= int(choice) <= len(visible) else None
+    connect(address or resolve(choice), arguments.dry_run)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="iw4x", description="List and join IW4x servers from the terminal.")
-    parser.add_argument("target", nargs="?", help="server name fragment or ip:port; omit for the picker")
+    parser.add_argument("target", nargs="?", help="server name fragment, list index or ip:port; omit for the picker")
     parser.add_argument("--list", "-l", action="store_true", help="list servers instead of joining")
     parser.add_argument("--all", "-a", action="store_true", help="include empty servers")
     parser.add_argument("--min-players", type=int, default=1, metavar="N", help="only servers with at least N players")

@@ -20,10 +20,11 @@ host:port` over the IW4x IPC pipe to the instance that is already running and
 exits. `iw4x` reuses exactly that path, running the client inside the game's
 own Proton prefix so both processes share a wineserver.
 
-When the game is not running, the URL is handed to Steam instead:
+Both the launch and the prefix come from the Steam non-Steam shortcut that runs
+`iw4x.exe` (`shortcuts.vdf`), so it never launches vanilla MW2:
 
 ```sh
-steam -applaunch 10190 iw4x://host:port
+steam -applaunch <shortcut appid> iw4x://host:port
 ```
 
 If Steam opens the game at the main menu rather than joining, run the same
@@ -44,9 +45,10 @@ show you.
 ./install.sh --protocol   # also make iw4x:// links in a browser open this CLI
 ```
 
-Requires Python 3.10+ and a Steam install of Call of Duty: Modern Warfare 2
-(app 10190) with IW4x. Override the Proton binary with `IW4X_PROTON` if the
-`config_info` lookup misses.
+Requires Python 3.10+ and an IW4x install added to Steam as a shortcut whose
+exe is `iw4x.exe` (the usual "Call of Duty Modern Warfare 2 (IW4x)" entry).
+Override the Proton binary with `IW4X_PROTON` if the `config_info` lookup
+misses.
 
 ## Licence
 
